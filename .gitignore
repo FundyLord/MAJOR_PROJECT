@@ -93,5 +93,3 @@ outputs/
 .LSOverride
 ehthumbs.db
 
-# SSH file
-*.sh
