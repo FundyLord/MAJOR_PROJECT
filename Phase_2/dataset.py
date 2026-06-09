@@ -70,6 +70,19 @@ class MerlinCTDataset(Dataset):
             print(f"[Dataset] WARNING: {n_missing} NIfTI files not found on disk — skipped.")
         self.df = self.df[exists].reset_index(drop=True)
 
+        # ── Auto-detect preprocessed .npy cache ─────────────────────────
+        # preprocess_dataset.py writes to  <data_dir>_npy/
+        # If that folder exists, use the fast path (~0.1s/sample)
+        # otherwise fall back to raw .nii.gz + scipy zoom (~6s/sample)
+        npy_dir = data_dir.rstrip("/") + "_npy"
+        self.use_npy = os.path.isdir(npy_dir)
+        self.npy_dir = npy_dir
+
+        if self.use_npy:
+            print(f"[Dataset] .npy cache found  →  fast path ({npy_dir})")
+        else:
+            print(f"[Dataset] No .npy cache  →  slow path (raw .nii.gz + zoom)")
+
         print(
             f"[Dataset] split={split!r}  |  samples={len(self.df)}  |  "
             f"num_slices={num_slices}  |  image_size={image_size}  |  "
@@ -106,9 +119,15 @@ class MerlinCTDataset(Dataset):
         study_id = str(row["study_id"])
         findings = str(row["findings"])
 
-        vol = self._load_and_preprocess(
-            os.path.join(self.data_dir, f"{study_id}.nii.gz")
-        )                                            # (Z, H, W), [0, 1]
+        if self.use_npy:
+            # Fast path: pre-zoomed, pre-normalised  (~0.1 s/sample)
+            vol = np.load(os.path.join(self.npy_dir, f"{study_id}.npy"))
+        else:
+            # Slow path: raw NIfTI + 3-D zoom           (~6 s/sample)
+            vol = self._load_and_preprocess(
+                os.path.join(self.data_dir, f"{study_id}.nii.gz")
+            )
+        # vol: float32 (num_slices, H, W), values in [0, 1]
 
         # Grayscale -> 3 channels: (Z, 3, H, W)
         vol_3ch = np.stack([vol, vol, vol], axis=1)
@@ -132,3 +151,4 @@ def merlin_collate_fn(batch: list) -> dict:
         # shape: (B, num_slices, 3, H, W)
         "findings":  [b["findings"] for b in batch],
     }
+
