@@ -1,13 +1,5 @@
 """
 dataset.py  —  Merlin Abdominal CT Dataset Loader
-
-Preprocessing matches the validated notebook (new_check.ipynb):
-  1. Load NIfTI  →  (X, Y, Z)
-  2. Transpose   →  (Z, Y, X)   — depth axis first
-  3. 3D cubic zoom on RAW HU values to target shape
-  4. HU clip [-200, 300]  AFTER zoom  (avoids interpolation artefacts at boundary)
-  5. Normalize  [0, 1]
-  6. Expand to 3 channels, apply SigLIP normalisation  →  [-1, 1]
 """
 
 import os
@@ -20,17 +12,6 @@ from scipy.ndimage import zoom
 
 
 class MerlinCTDataset(Dataset):
-    """
-    Args:
-        data_dir     : flat folder containing  <study_id>.nii.gz  files
-        reports_xlsx : path to  reports_final.xlsx
-        split        : 'train' | 'val' | 'test'
-        num_slices   : target depth after 3-D zoom  (Z axis)
-        image_size   : target H and W after zoom    (SigLIP expects 224)
-        hu_min       : soft-tissue window lower bound
-        hu_max       : soft-tissue window upper bound
-    """
-
     def __init__(
         self,
         data_dir:     str,
@@ -54,29 +35,35 @@ class MerlinCTDataset(Dataset):
                       .str.lower()
                       .str.replace(" ", "_", regex=False)
         )
-        # Expected columns after normalisation: study_id, findings, split, few_shot
-
         self.df = (
             df[df["split"].str.strip().str.lower() == split.lower()]
             .reset_index(drop=True)
         )
 
-        # Drop rows whose NIfTI file is missing
-        exists = self.df["study_id"].apply(
-            lambda sid: os.path.exists(os.path.join(data_dir, f"{sid}.nii.gz"))
-        )
-        n_missing = int((~exists).sum())
-        if n_missing:
-            print(f"[Dataset] WARNING: {n_missing} NIfTI files not found on disk — skipped.")
-        self.df = self.df[exists].reset_index(drop=True)
-
-        # ── Auto-detect preprocessed .npy cache ─────────────────────────
-        # preprocess_dataset.py writes to  <data_dir>_npy/
-        # If that folder exists, use the fast path (~0.1s/sample)
-        # otherwise fall back to raw .nii.gz + scipy zoom (~6s/sample)
+        # Auto-detect .npy cache FIRST
         npy_dir = data_dir.rstrip("/") + "_npy"
         self.use_npy = os.path.isdir(npy_dir)
         self.npy_dir = npy_dir
+
+        # Filter missing files — check .npy if cache exists, .nii.gz otherwise
+        # This correctly catches files that failed preprocessing
+        if self.use_npy:
+            exists = self.df["study_id"].apply(
+                lambda sid: os.path.exists(
+                    os.path.join(npy_dir, f"{sid}.npy")
+                )
+            )
+        else:
+            exists = self.df["study_id"].apply(
+                lambda sid: os.path.exists(
+                    os.path.join(data_dir, f"{sid}.nii.gz")
+                )
+            )
+
+        n_missing = int((~exists).sum())
+        if n_missing:
+            print(f"[Dataset] WARNING: {n_missing} files not found on disk — skipped.")
+        self.df = self.df[exists].reset_index(drop=True)
 
         if self.use_npy:
             print(f"[Dataset] .npy cache found  →  fast path ({npy_dir})")
@@ -90,26 +77,18 @@ class MerlinCTDataset(Dataset):
         )
 
     def _load_and_preprocess(self, path: str) -> np.ndarray:
-        """Returns float32 ndarray (num_slices, image_size, image_size) in [0, 1]."""
         nii = nib.load(path)
-        vol = nii.get_fdata(dtype=np.float32)       # (X, Y, Z)
-
-        # (X, Y, Z) -> (Z, Y, X)
+        vol = nii.get_fdata(dtype=np.float32)
         vol = np.transpose(vol, (2, 1, 0))
-
-        # 3-D cubic zoom on raw HU — matches notebook zoom() call
         factors = (
             self.num_slices / vol.shape[0],
             self.image_size / vol.shape[1],
             self.image_size / vol.shape[2],
         )
-        vol = zoom(vol, factors, order=3)           # (num_slices, H, W)
-
-        # Clip AFTER zoom, then normalise
+        vol = zoom(vol, factors, order=3)
         vol = np.clip(vol, self.hu_min, self.hu_max)
         vol = (vol - self.hu_min) / (self.hu_max - self.hu_min)
-
-        return vol                                   # float32, [0, 1]
+        return vol
 
     def __len__(self) -> int:
         return len(self.df)
@@ -120,35 +99,26 @@ class MerlinCTDataset(Dataset):
         findings = str(row["findings"])
 
         if self.use_npy:
-            # Fast path: pre-zoomed, pre-normalised  (~0.1 s/sample)
             vol = np.load(os.path.join(self.npy_dir, f"{study_id}.npy"))
         else:
-            # Slow path: raw NIfTI + 3-D zoom           (~6 s/sample)
             vol = self._load_and_preprocess(
                 os.path.join(self.data_dir, f"{study_id}.nii.gz")
             )
-        # vol: float32 (num_slices, H, W), values in [0, 1]
 
-        # Grayscale -> 3 channels: (Z, 3, H, W)
         vol_3ch = np.stack([vol, vol, vol], axis=1)
         slices  = torch.from_numpy(vol_3ch).float()
-
-        # SigLIP normalisation: [0, 1] -> [-1, 1]
-        slices = (slices - 0.5) / 0.5
+        slices  = (slices - 0.5) / 0.5
 
         return {
             "study_id": study_id,
-            "slices":   slices,     # (num_slices, 3, H, W)
-            "findings": findings,   # raw string — tokenised in training loop
+            "slices":   slices,
+            "findings": findings,
         }
 
 
 def merlin_collate_fn(batch: list) -> dict:
-    """Stack slices into a tensor; keep findings as a list of strings."""
     return {
         "study_ids": [b["study_id"] for b in batch],
         "slices":    torch.stack([b["slices"] for b in batch]),
-        # shape: (B, num_slices, 3, H, W)
         "findings":  [b["findings"] for b in batch],
     }
-

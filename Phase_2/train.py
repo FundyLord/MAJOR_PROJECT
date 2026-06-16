@@ -239,6 +239,7 @@ def train_phase1(args):
 
     global_step = start_step
     accum       = args.grad_accum_steps
+    best_val_loss = float('inf')
 
     for epoch in range(start_epoch, args.num_epochs):
         satt.train()
@@ -286,6 +287,21 @@ def train_phase1(args):
         val_loss /= max(len(val_loader), 1)
         logging.info(f"Epoch {epoch} complete  val_loss={val_loss:.4f}")
 
+        # Save best model based on validation loss
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_path = os.path.join(args.checkpoint_dir, "phase1_best.pt")
+            torch.save({
+                "step": global_step,
+                "epoch": epoch,
+                "loss": val_loss,
+                "satt_state": satt.state_dict(),
+                "optimizer_state": optimizer.state_dict(),
+            }, best_path)
+            logging.info(f"[Best] New best val_loss={val_loss:.4f} saved to {best_path}")
+        else:
+            logging.info(f"[Best] val_loss={val_loss:.4f} did not improve from {best_val_loss:.4f}")
+
     # Final save
     save_checkpoint(
         satt, optimizer, global_step, epoch,
@@ -330,14 +346,19 @@ def train_phase2(args):
     tokenizer      = build_tokenizer()
     llm_device     = next(llm.parameters()).device
 
-    # Load Phase 1 SATT weights
-    p1_pointer = os.path.join(args.checkpoint_dir, "phase1_latest.txt")
-    if os.path.exists(p1_pointer):
+    # Load Phase 1 SATT weights — prefer best over latest
+    best_path   = os.path.join(args.checkpoint_dir, "phase1_best.pt")
+    p1_pointer  = os.path.join(args.checkpoint_dir, "phase1_latest.txt")
+    if os.path.exists(best_path):
+        ckpt = torch.load(best_path, map_location="cpu")
+        satt.load_state_dict(ckpt["satt_state"])
+        logging.info(f"[Phase 2] Loaded Phase 1 BEST checkpoint (val_loss={ckpt['loss']:.4f})")
+    elif os.path.exists(p1_pointer):
         with open(p1_pointer) as f:
             p1_path = f.read().strip()
         ckpt = torch.load(p1_path, map_location="cpu")
         satt.load_state_dict(ckpt["satt_state"])
-        logging.info(f"[Phase 2] Loaded Phase 1 SATT from {p1_path}")
+        logging.info(f"[Phase 2] Loaded Phase 1 LATEST checkpoint from {p1_path}")
     else:
         logging.warning("[Phase 2] No Phase 1 checkpoint found — SATT starts from random init.")
 
@@ -353,6 +374,7 @@ def train_phase2(args):
 
     global_step = start_step
     accum       = args.grad_accum_steps
+    best_val_loss = float('inf')
 
     for epoch in range(start_epoch, args.num_epochs):
         satt.train()
@@ -401,6 +423,22 @@ def train_phase2(args):
                 val_loss += vl.item()
         val_loss /= max(len(val_loader), 1)
         logging.info(f"Epoch {epoch} complete  val_loss={val_loss:.4f}")
+
+        # Save best model: LoRA adapter (via PEFT) + SATT weights
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_lora_dir = os.path.join(args.checkpoint_dir, "phase2_best_lora")
+            os.makedirs(best_lora_dir, exist_ok=True)
+            llm.save_pretrained(best_lora_dir)
+            torch.save({
+                "step": global_step,
+                "epoch": epoch,
+                "loss": val_loss,
+                "satt_state": satt.state_dict(),
+            }, os.path.join(args.checkpoint_dir, "phase2_best_satt.pt"))
+            logging.info(f"[Best] New best val_loss={val_loss:.4f} saved (LoRA -> {best_lora_dir})")
+        else:
+            logging.info(f"[Best] val_loss={val_loss:.4f} did not improve from {best_val_loss:.4f}")
 
     save_checkpoint(
         satt, optimizer, global_step, epoch,

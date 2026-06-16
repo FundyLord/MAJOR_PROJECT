@@ -18,7 +18,7 @@ from transformers import (
     AutoTokenizer,
     BitsAndBytesConfig,
 )
-from peft import LoraConfig, get_peft_model
+from peft import LoraConfig, get_peft_model, PeftModel
 
 # ── Model IDs ────────────────────────────────────────────────────────────────
 SIGLIP_ID   = "google/siglip-base-patch16-224"
@@ -150,6 +150,27 @@ def build_llm_phase2() -> AutoModelForCausalLM:
     )
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
+    return model
+
+
+def build_llm_phase2_eval(lora_dir: str) -> AutoModelForCausalLM:
+    """
+    Load Llama in 4-bit NF4 and apply a TRAINED LoRA adapter from lora_dir
+    (e.g. checkpoints/phase2_best_lora/). Used for evaluation/inference —
+    unlike build_llm_phase2(), this does NOT create fresh random LoRA weights.
+    """
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch.bfloat16,
+        bnb_4bit_use_double_quant=True,
+    )
+    base_model = AutoModelForCausalLM.from_pretrained(
+        LLAMA_ID,
+        quantization_config=bnb_config,
+        device_map="auto",
+    )
+    model = PeftModel.from_pretrained(base_model, lora_dir)
     return model
 
 

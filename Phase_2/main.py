@@ -82,6 +82,8 @@ def parse_args():
                    help="Log loss every N gradient steps")
     p.add_argument("--save_every", type=int, default=500,
                    help="Save checkpoint every N gradient steps")
+    p.add_argument("--eval_max_samples", type=int, default=300,
+                   help="Randomly subsample N test samples for eval (0 = all)")
 
     return p.parse_args()
 

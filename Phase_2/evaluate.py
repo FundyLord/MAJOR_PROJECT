@@ -10,18 +10,21 @@ Requires:  pip install sacrebleu rouge-score
 """
 
 import os
+import time
+import random
 import logging
 import torch
 import pandas as pd
 from torch.utils.data import DataLoader
 from sacrebleu.metrics import BLEU
 from rouge_score import rouge_scorer as rs
+from bert_score import score as bert_score
 
 from dataset import MerlinCTDataset, merlin_collate_fn
 from model import (
     SATTAdapter,
     build_vision_encoder,
-    build_llm_phase2,
+    build_llm_phase2_eval,
     build_tokenizer,
     encode_volume_slices,
 )
@@ -89,11 +92,16 @@ def run_evaluation(args):
     # Models
     vision_encoder = build_vision_encoder().to(device)
     satt           = SATTAdapter().to(device)
-    llm            = build_llm_phase2()
+    lora_dir       = os.path.join(args.checkpoint_dir, "phase2_best_lora")
+    llm            = build_llm_phase2_eval(lora_dir)
     tokenizer      = build_tokenizer()
+    logging.info(f"[Eval] Loaded LoRA adapter from {lora_dir}")
 
-    # Load Phase 2 SATT checkpoint
-    load_checkpoint(args.checkpoint_dir, phase=2, satt=satt)
+    # Load Phase 2 best SATT weights directly (no optimizer needed for eval)
+    best_satt_path = os.path.join(args.checkpoint_dir, "phase2_best_satt.pt")
+    ckpt = torch.load(best_satt_path, map_location="cpu", weights_only=False)
+    satt.load_state_dict(ckpt["satt_state"])
+    logging.info(f"[Eval] Loaded SATT from {best_satt_path} (val_loss={ckpt['loss']:.4f})")
 
     # Dataset (test split, no shuffle)
     test_ds = MerlinCTDataset(
@@ -101,9 +109,17 @@ def run_evaluation(args):
         split="test", num_slices=args.num_slices,
     )
 
-    predictions, references, study_ids = [], [], []
+    if args.eval_max_samples > 0 and args.eval_max_samples < len(test_ds):
+        random.seed(42)
+        indices = sorted(random.sample(range(len(test_ds)), args.eval_max_samples))
+        logging.info(f"[Eval] Subsampling {args.eval_max_samples} / {len(test_ds)} test samples (seed=42)")
+    else:
+        indices = list(range(len(test_ds)))
 
-    for i in range(len(test_ds)):
+    predictions, references, study_ids = [], [], []
+    t0 = time.time()
+
+    for n, i in enumerate(indices):
         sample   = test_ds[i]
         pred     = generate_report(
             vision_encoder, satt, llm, tokenizer, sample["slices"]
@@ -112,8 +128,14 @@ def run_evaluation(args):
         references.append(sample["findings"])
         study_ids.append(sample["study_id"])
 
-        if i % 100 == 0:
-            logging.info(f"Evaluated {i} / {len(test_ds)}")
+        if (n + 1) % 10 == 0:
+            elapsed = time.time() - t0
+            rate = elapsed / (n + 1)
+            eta_min = rate * (len(indices) - (n + 1)) / 60
+            logging.info(
+                f"Evaluated {n+1} / {len(indices)}  |  "
+                f"{rate:.1f}s/sample  |  ETA {eta_min:.1f} min"
+            )
 
     # ── BLEU-4 ──────────────────────────────────────────────────────────
     bleu        = BLEU(max_ngram_order=4)
@@ -127,9 +149,18 @@ def run_evaluation(args):
     ]
     avg_rougeL = sum(rougeL_scores) / len(rougeL_scores)
 
+    # BERT Score — semantic similarity via contextual embeddings
+    logging.info("Computing BERT Score (this may take a few minutes)...")
+    _, _, bert_f1 = bert_score(
+        predictions, references, lang="en", verbose=False,
+        model_type="distilbert-base-uncased"
+    )
+    avg_bert_f1 = bert_f1.mean().item()
+
     logging.info("=" * 40)
-    logging.info(f"BLEU-4  : {bleu_result.score:.4f}")
-    logging.info(f"ROUGE-L : {avg_rougeL:.4f}")
+    logging.info(f"BLEU-4     : {bleu_result.score:.4f}")
+    logging.info(f"ROUGE-L    : {avg_rougeL:.4f}")
+    logging.info(f"BERTScore-F1: {avg_bert_f1:.4f}")
     logging.info("=" * 40)
 
     # Save detailed CSV
@@ -139,7 +170,8 @@ def run_evaluation(args):
         "prediction": predictions,
         "reference":  references,
         "rougeL":     rougeL_scores,
+        "bert_f1":    bert_f1.tolist(),
     }).to_csv(out_path, index=False)
     logging.info(f"Detailed results saved → {out_path}")
 
-    return {"bleu4": bleu_result.score, "rougeL": avg_rougeL}
+    return {"bleu4": bleu_result.score, "rougeL": avg_rougeL, "bert_f1": avg_bert_f1}
