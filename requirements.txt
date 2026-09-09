@@ -1,13 +1,29 @@
+# ── Core ML ──────────────────────────────────────────────────────────────────
 torch>=2.0.0
 transformers>=4.35.0
-nibabel>=5.0.0
-scipy>=1.10.0
-numpy>=1.23.0
-huggingface_hub>=0.19.0
-pandas>=2.0.0
-matplotlib>=3.7.0
-sentencepiece>=0.1.97
-protobuf>=6.28.0
 peft>=0.7.0
 bitsandbytes>=0.41.0
 datasets>=3.2.0
+huggingface_hub>=0.19.0
+
+# ── Medical imaging ───────────────────────────────────────────────────────────
+nibabel>=5.0.0
+scipy>=1.10.0
+
+# ── Data ─────────────────────────────────────────────────────────────────────
+numpy>=1.23.0
+pandas>=2.0.0
+
+# ── Tokenisation ─────────────────────────────────────────────────────────────
+sentencepiece>=0.1.97
+protobuf>=6.28.0
+
+# ── Evaluation metrics ────────────────────────────────────────────────────────
+sacrebleu>=2.3.0          # BLEU-4
+rouge-score>=0.1.2        # ROUGE-1, ROUGE-2, ROUGE-L
+bert-score>=0.3.13        # ClinicalBERT Score
+nltk>=3.8.0               # METEOR
+radgraph>=0.0.8           # RadGraph-F1
+
+# ── Visualisation ─────────────────────────────────────────────────────────────
+matplotlib>=3.7.0

@@ -1,13 +1,15 @@
 """
-model.py  —  SATT Model Components
+model.py  —  SATT Model Components (v2 — supports baseline + ablation variants)
 
 Defines:
-  SATTAdapter          — the novel temporal compression + projection module
+  SATTAdapter          — novel temporal compression + projection (chunk_size configurable)
+  MeanPoolAdapter      — simple mean-pool baseline (no temporal grouping)
   build_vision_encoder — frozen SigLIP-base-patch16-224
   build_llm_phase1     — Llama-3.2-3B in BF16, fully frozen
-  build_llm_phase2     — Llama-3.2-3B in 4-bit NF4 + LoRA adapters
+  build_llm_phase2     — Llama-3.2-3B in 4-bit NF4 + LoRA adapters (training)
+  build_llm_phase2_eval— Llama-3.2-3B in 4-bit NF4 + trained LoRA (evaluation)
   build_tokenizer      — Llama tokenizer
-  encode_volume_slices — batched SigLIP + SATT forward pass
+  encode_volume_slices — batched SigLIP + adapter forward pass
 """
 
 import torch
@@ -37,19 +39,19 @@ class SATTAdapter(nn.Module):
     Slice-Aware Temporal Transformer Adapter.
 
     Compresses Z SigLIP embeddings into a compact token sequence
-    suitable for Llama's embedding space.
+    suitable for Llama's embedding space via temporal chunking.
 
     Input  shape : (Z, N, vision_dim)   e.g. (64, 196, 768)
-    Output shape : (1, T*N, llm_dim)    e.g. (1, 3136, 3072)
+    Output shape : (1, T*N, llm_dim)    e.g. (1, 3136, 3072) for chunk_size=4
 
-    where T = Z // chunk_size  (default 64 // 4 = 16)
+    where T = Z // chunk_size
     """
 
     def __init__(
         self,
         vision_dim: int = VISION_DIM,
         llm_dim:    int = LLM_DIM,
-        chunk_size: int = 4,
+        chunk_size: int = 4,          # ablation: try 2, 4, 8
         num_heads:  int = 8,
         num_layers: int = 2,
         dropout:    float = 0.1,
@@ -95,6 +97,49 @@ class SATTAdapter(nn.Module):
         return self.projector(contextualized)
 
 
+# ── Mean-Pool Baseline ────────────────────────────────────────────────────────
+
+class MeanPoolAdapter(nn.Module):
+    """
+    Simple mean-pool baseline for ablation comparison.
+
+    Averages ALL slice embeddings into a single set of patch tokens.
+    No temporal grouping, no Temporal Transformer — just global mean pool
+    then MLP projection.
+
+    Input  shape : (Z, N, vision_dim)   e.g. (64, 196, 768)
+    Output shape : (1, N, llm_dim)      e.g. (1, 196, 3072)
+
+    This is the simplest possible way to aggregate 3D CT features.
+    Comparing SATT against this baseline proves temporal chunking adds value.
+    """
+
+    def __init__(
+        self,
+        vision_dim: int = VISION_DIM,
+        llm_dim:    int = LLM_DIM,
+    ):
+        super().__init__()
+        self.projector = nn.Sequential(
+            nn.Linear(vision_dim, 2048),
+            nn.GELU(),
+            nn.Linear(2048, llm_dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x : (Z, N, D)  — num_slices × num_patches × vision_dim
+        Returns:
+            (1, N, llm_dim)
+        """
+        # Global mean pool across all slices  →  (1, N, D)
+        pooled = x.mean(dim=0, keepdim=True)   # (1, N, D)
+
+        # MLP projection  →  (1, N, llm_dim)
+        return self.projector(pooled)
+
+
 # ── Builder helpers ──────────────────────────────────────────────────────────
 
 def build_vision_encoder() -> SiglipVisionModel:
@@ -123,8 +168,8 @@ def build_llm_phase1() -> AutoModelForCausalLM:
 
 def build_llm_phase2() -> AutoModelForCausalLM:
     """
-    Phase 2: Llama in 4-bit NF4 + LoRA on all 7 projection layers.
-    Matches the validated notebook configuration.
+    Phase 2 (training): Llama in 4-bit NF4 + LoRA on all 7 projection layers.
+    Creates fresh random LoRA weights — use for training only.
     """
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
@@ -155,9 +200,8 @@ def build_llm_phase2() -> AutoModelForCausalLM:
 
 def build_llm_phase2_eval(lora_dir: str) -> AutoModelForCausalLM:
     """
-    Load Llama in 4-bit NF4 and apply a TRAINED LoRA adapter from lora_dir
-    (e.g. checkpoints/phase2_best_lora/). Used for evaluation/inference —
-    unlike build_llm_phase2(), this does NOT create fresh random LoRA weights.
+    Phase 2 (evaluation/inference): Load Llama 4-bit + TRAINED LoRA adapter.
+    Use this for evaluation — NOT build_llm_phase2() which has random LoRA.
     """
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
@@ -184,24 +228,25 @@ def build_tokenizer() -> AutoTokenizer:
 
 def encode_volume_slices(
     vision_encoder: nn.Module,
-    satt_adapter:   SATTAdapter,
+    adapter:        nn.Module,       # SATTAdapter OR MeanPoolAdapter
     slices:         torch.Tensor,
     micro_batch:    int = 8,
 ) -> torch.Tensor:
     """
-    Encode a batch of CT volumes through SigLIP + SATTAdapter.
+    Encode a batch of CT volumes through SigLIP + adapter (SATT or baseline).
 
     Args:
-        vision_encoder : frozen SigLIP (or a mock in tests)
-        satt_adapter   : SATTAdapter module
+        vision_encoder : frozen SigLIP (or mock in tests)
+        adapter        : SATTAdapter or MeanPoolAdapter
         slices         : (B, Z, 3, H, W)
         micro_batch    : number of slices per SigLIP forward (VRAM control)
 
     Returns:
-        visual_tokens  : (B, T*N, llm_dim)
+        visual_tokens  : (B, T*N, llm_dim)   SATT
+                      or (B, N,   llm_dim)   MeanPool
     """
     B, Z, C, H, W = slices.shape
-    device = next(satt_adapter.parameters()).device
+    device = next(adapter.parameters()).device
     tokens_list = []
 
     for b in range(B):
@@ -216,7 +261,7 @@ def encode_volume_slices(
             embeddings.append(out.last_hidden_state.float())   # (mb, 196, 768)
 
         E      = torch.cat(embeddings, dim=0)   # (Z, 196, 768)
-        tokens = satt_adapter(E)                # (1, T*N, llm_dim)
+        tokens = adapter(E)                      # (1, T*N or N, llm_dim)
         tokens_list.append(tokens)
 
-    return torch.cat(tokens_list, dim=0)        # (B, T*N, llm_dim)
+    return torch.cat(tokens_list, dim=0)         # (B, T*N or N, llm_dim)

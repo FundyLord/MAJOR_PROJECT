@@ -127,7 +127,7 @@ class SATTInference:
         print("\n[SATTInference] All models loaded. Ready to generate reports.\n")
 
     @torch.no_grad()
-    def generate_report(self, nifti_path: str, max_new_tokens: int = 250) -> str:
+    def generate_report(self, nifti_path: str, max_new_tokens: int = 800) -> str:
         """
         Generate a radiology report for a single CT scan (.nii.gz).
         Returns the generated report as a string.
@@ -170,6 +170,7 @@ class SATTInference:
             max_new_tokens=max_new_tokens,
             do_sample=False,
             repetition_penalty=1.1,
+            no_repeat_ngram_size=4,
             pad_token_id=self.tokenizer.eos_token_id,
         )
 

@@ -1,11 +1,8 @@
 """
-train.py  —  Phase 1 and Phase 2 training loops
+train.py  —  Phase 1 and Phase 2 training loops (v2)
 
-Phase 1 : Only SATTAdapter is trainable. SigLIP and Llama are frozen.
-          Loss = cross-entropy on report tokens (visual tokens masked with -100).
-
-Phase 2 : SATTAdapter + LoRA adapters inside Llama are trainable.
-          Loads SATT weights from the best Phase 1 checkpoint automatically.
+Supports --model_type satt | baseline and --chunk_size 2|4|8
+via args passed from main.py build_adapter().
 """
 
 import os
@@ -16,7 +13,6 @@ from torch.utils.data import DataLoader
 
 from dataset import MerlinCTDataset, merlin_collate_fn
 from model import (
-    SATTAdapter,
     build_vision_encoder,
     build_llm_phase1,
     build_llm_phase2,
@@ -37,26 +33,12 @@ SYSTEM_PROMPT = (
 
 
 def build_prompt(findings: str) -> tuple:
-    """Return (prompt_text, target_text) for causal-LM training."""
     return SYSTEM_PROMPT, findings + "<|eot_id|>"
 
 
 # ── Tokenisation ─────────────────────────────────────────────────────────────
 
-def tokenize_batch(
-    tokenizer,
-    findings_list: list,
-    device,
-    max_length: int = 512,
-):
-    """
-    Tokenise a list of findings strings.
-
-    Returns:
-        input_ids      : (B, L)  — full sequence (prompt + findings)
-        attention_mask : (B, L)
-        labels         : (B, L)  — prompt tokens masked with -100
-    """
+def tokenize_batch(tokenizer, findings_list, device, max_length=512):
     all_input_ids, all_labels = [], []
 
     for findings in findings_list:
@@ -76,12 +58,11 @@ def tokenize_batch(
         ).input_ids[0]
 
         labels = full_ids.clone()
-        labels[: len(prompt_ids)] = -100   # mask prompt — only predict findings
+        labels[: len(prompt_ids)] = -100
 
         all_input_ids.append(full_ids)
         all_labels.append(labels)
 
-    # Pad to same length
     max_len = max(t.shape[0] for t in all_input_ids)
 
     def pad(seq, pad_val):
@@ -92,11 +73,9 @@ def tokenize_batch(
     input_ids = torch.stack(
         [pad(t, tokenizer.pad_token_id) for t in all_input_ids]
     ).to(device)
-
     labels = torch.stack(
         [pad(t, -100) for t in all_labels]
     ).to(device)
-
     attention_mask = (input_ids != tokenizer.pad_token_id).long()
 
     return input_ids, attention_mask, labels
@@ -104,30 +83,43 @@ def tokenize_batch(
 
 # ── Checkpointing ─────────────────────────────────────────────────────────────
 
-def save_checkpoint(satt, optimizer, step, epoch, loss, ckpt_dir, phase):
-    """Save SATT weights + optimizer state. Write a 'latest' pointer file."""
+def _ckpt_prefix(args):
+    """Generate checkpoint filename prefix based on model type."""
+    if args.model_type == "baseline":
+        return "baseline"
+    return f"satt_chunk{args.chunk_size}"
+
+
+def save_checkpoint(adapter, optimizer, step, epoch, loss, ckpt_dir, phase, args):
     os.makedirs(ckpt_dir, exist_ok=True)
-    ckpt_path = os.path.join(ckpt_dir, f"phase{phase}_step{step:07d}.pt")
+    prefix    = _ckpt_prefix(args)
+    ckpt_path = os.path.join(
+        ckpt_dir, f"phase{phase}_{prefix}_step{step:07d}.pt"
+    )
     torch.save(
         {
-            "step":           step,
-            "epoch":          epoch,
-            "loss":           loss,
-            "satt_state":     satt.state_dict(),
+            "step":            step,
+            "epoch":           epoch,
+            "loss":            loss,
+            "model_type":      args.model_type,
+            "chunk_size":      getattr(args, "chunk_size", None),
+            "satt_state":      adapter.state_dict(),
             "optimizer_state": optimizer.state_dict(),
         },
         ckpt_path,
     )
-    # Overwrite latest pointer
-    pointer = os.path.join(ckpt_dir, f"phase{phase}_latest.txt")
+    pointer = os.path.join(ckpt_dir, f"phase{phase}_{prefix}_latest.txt")
     with open(pointer, "w") as f:
         f.write(ckpt_path)
-    logging.info(f"[Checkpoint] saved  step={step}  →  {ckpt_path}")
+    logging.info(f"[Checkpoint] saved step={step}  →  {ckpt_path}")
 
 
-def load_checkpoint(ckpt_dir, phase, satt, optimizer=None):
-    """Load from latest checkpoint if it exists. Returns (start_step, start_epoch)."""
-    pointer = os.path.join(ckpt_dir, f"phase{phase}_latest.txt")
+def load_checkpoint(ckpt_dir, phase, adapter, args, optimizer=None):
+    prefix  = _ckpt_prefix(args)
+    pointer = os.path.join(ckpt_dir, f"phase{phase}_{prefix}_latest.txt")
+    if not os.path.exists(pointer):
+        # Fallback: try old-style pointer (for SATT chunk=4 trained previously)
+        pointer = os.path.join(ckpt_dir, f"phase{phase}_latest.txt")
     if not os.path.exists(pointer):
         logging.info("[Checkpoint] No existing checkpoint — starting from scratch.")
         return 0, 0
@@ -135,53 +127,41 @@ def load_checkpoint(ckpt_dir, phase, satt, optimizer=None):
     with open(pointer) as f:
         ckpt_path = f.read().strip()
 
-    ckpt = torch.load(ckpt_path, map_location="cpu")
-    satt.load_state_dict(ckpt["satt_state"])
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    adapter.load_state_dict(ckpt["satt_state"])
     if optimizer is not None:
         optimizer.load_state_dict(ckpt["optimizer_state"])
-
-    logging.info(f"[Checkpoint] Resumed  step={ckpt['step']}  epoch={ckpt['epoch']}  from {ckpt_path}")
+    logging.info(f"[Checkpoint] Resumed step={ckpt['step']} epoch={ckpt['epoch']}")
     return ckpt["step"], ckpt["epoch"]
 
 
 # ── Shared forward pass ───────────────────────────────────────────────────────
 
-def forward_pass(slices, findings, vision_encoder, satt, llm, tokenizer, llm_device, args):
-    """
-    Shared forward pass for both phases.
-    Returns the scalar loss.
-    """
-    # 1. Vision encoding
+def forward_pass(slices, findings, vision_encoder, adapter, llm,
+                 tokenizer, llm_device, args):
     visual_tokens = encode_volume_slices(
-        vision_encoder, satt, slices, micro_batch=8
-    )                                                   # (B, T*N, llm_dim)
+        vision_encoder, adapter, slices, micro_batch=8
+    )
     visual_tokens = visual_tokens.to(llm_device)
 
-    # 2. Tokenise findings
     input_ids, attn_mask, labels = tokenize_batch(
         tokenizer, findings, llm_device, args.max_text_len
     )
-
-    # 3. Text embeddings
-    text_embeds = llm.get_input_embeddings()(input_ids)  # (B, L, llm_dim)
-    vis_tokens  = visual_tokens.to(text_embeds.dtype)
-
-    # 4. Concatenate visual + text tokens
+    text_embeds   = llm.get_input_embeddings()(input_ids)
+    vis_tokens    = visual_tokens.to(text_embeds.dtype)
     inputs_embeds = torch.cat([vis_tokens, text_embeds], dim=1)
 
-    vis_mask   = torch.ones(
+    vis_mask    = torch.ones(
         vis_tokens.shape[0], vis_tokens.shape[1],
         device=llm_device, dtype=attn_mask.dtype
     )
-    full_mask  = torch.cat([vis_mask, attn_mask], dim=1)
-
-    vis_labels = torch.full(
+    full_mask   = torch.cat([vis_mask, attn_mask], dim=1)
+    vis_labels  = torch.full(
         (vis_tokens.shape[0], vis_tokens.shape[1]),
         -100, device=llm_device, dtype=labels.dtype
     )
     full_labels = torch.cat([vis_labels, labels], dim=1)
 
-    # 5. LLM forward
     with torch.amp.autocast("cuda", dtype=torch.bfloat16):
         out = llm(
             inputs_embeds=inputs_embeds,
@@ -194,20 +174,22 @@ def forward_pass(slices, findings, vision_encoder, satt, llm, tokenizer, llm_dev
 # ── Phase 1 ───────────────────────────────────────────────────────────────────
 
 def train_phase1(args):
+    from main import build_adapter
+
     logging.info("=" * 60)
-    logging.info("PHASE 1 — SATT Alignment Training")
+    logging.info(f"PHASE 1 — Alignment Training "
+                 f"[{args.model_type} chunk={getattr(args,'chunk_size','N/A')}]")
     logging.info("=" * 60)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Dataset
     train_ds = MerlinCTDataset(
-        args.data_dir, args.reports_xlsx,
-        split="train", num_slices=args.num_slices,
+        args.data_dir, args.reports_xlsx, split="train",
+        num_slices=args.num_slices,
     )
     val_ds = MerlinCTDataset(
-        args.data_dir, args.reports_xlsx,
-        split="val", num_slices=args.num_slices,
+        args.data_dir, args.reports_xlsx, split="val",
+        num_slices=args.num_slices,
     )
     train_loader = DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=True,
@@ -220,42 +202,42 @@ def train_phase1(args):
         pin_memory=True,
     )
 
-    # Models
     vision_encoder = build_vision_encoder().to(device)
-    satt           = SATTAdapter().to(device)
+    adapter        = build_adapter(args).to(device)
     llm            = build_llm_phase1()
     tokenizer      = build_tokenizer()
     llm_device     = next(llm.parameters()).device
 
-    # Only SATT is trainable in Phase 1
-    optimizer = torch.optim.AdamW(satt.parameters(), lr=args.lr, weight_decay=0.01)
+    optimizer = torch.optim.AdamW(
+        adapter.parameters(), lr=args.lr, weight_decay=0.01
+    )
 
-    # Resume
     start_step, start_epoch = 0, 0
     if args.resume_from == "latest":
         start_step, start_epoch = load_checkpoint(
-            args.checkpoint_dir, phase=1, satt=satt, optimizer=optimizer
+            args.checkpoint_dir, phase=1, adapter=adapter,
+            args=args, optimizer=optimizer
         )
 
-    global_step = start_step
-    accum       = args.grad_accum_steps
-    best_val_loss = float('inf')
+    global_step  = start_step
+    accum        = args.grad_accum_steps
+    best_val     = float("inf")
 
     for epoch in range(start_epoch, args.num_epochs):
-        satt.train()
+        adapter.train()
         optimizer.zero_grad()
         running_loss = 0.0
 
         for step, batch in enumerate(train_loader):
             loss = forward_pass(
                 batch["slices"], batch["findings"],
-                vision_encoder, satt, llm, tokenizer, llm_device, args,
+                vision_encoder, adapter, llm, tokenizer, llm_device, args,
             )
             (loss / accum).backward()
             running_loss += loss.item()
 
             if (step + 1) % accum == 0:
-                torch.nn.utils.clip_grad_norm_(satt.parameters(), 1.0)
+                torch.nn.utils.clip_grad_norm_(adapter.parameters(), 1.0)
                 optimizer.step()
                 optimizer.zero_grad()
                 global_step += 1
@@ -263,49 +245,53 @@ def train_phase1(args):
                 if global_step % args.log_every == 0:
                     avg = running_loss / args.log_every
                     logging.info(
-                        f"Epoch {epoch}  step {global_step}  "
-                        f"train_loss={avg:.4f}"
+                        f"Epoch {epoch}  step {global_step}  train_loss={avg:.4f}"
                     )
                     running_loss = 0.0
 
                 if global_step % args.save_every == 0:
                     save_checkpoint(
-                        satt, optimizer, global_step, epoch,
-                        loss.item(), args.checkpoint_dir, phase=1,
+                        adapter, optimizer, global_step, epoch,
+                        loss.item(), args.checkpoint_dir, phase=1, args=args,
                     )
 
         # Validation
-        satt.eval()
+        adapter.eval()
         val_loss = 0.0
         with torch.no_grad():
-            for vbatch in val_loader:
+            for vb in val_loader:
                 vl = forward_pass(
-                    vbatch["slices"], vbatch["findings"],
-                    vision_encoder, satt, llm, tokenizer, llm_device, args,
+                    vb["slices"], vb["findings"],
+                    vision_encoder, adapter, llm, tokenizer, llm_device, args,
                 )
                 val_loss += vl.item()
         val_loss /= max(len(val_loader), 1)
         logging.info(f"Epoch {epoch} complete  val_loss={val_loss:.4f}")
 
-        # Save best model based on validation loss
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            best_path = os.path.join(args.checkpoint_dir, "phase1_best.pt")
+        if val_loss < best_val:
+            best_val = val_loss
+            prefix   = _ckpt_prefix(args)
+            best_path = os.path.join(
+                args.checkpoint_dir, f"phase1_best_{prefix}.pt"
+            )
             torch.save({
-                "step": global_step,
-                "epoch": epoch,
-                "loss": val_loss,
-                "satt_state": satt.state_dict(),
+                "step":       global_step,
+                "epoch":      epoch,
+                "loss":       val_loss,
+                "model_type": args.model_type,
+                "chunk_size": getattr(args, "chunk_size", None),
+                "satt_state": adapter.state_dict(),
                 "optimizer_state": optimizer.state_dict(),
             }, best_path)
-            logging.info(f"[Best] New best val_loss={val_loss:.4f} saved to {best_path}")
+            logging.info(f"[Best] New best val_loss={val_loss:.4f} → {best_path}")
         else:
-            logging.info(f"[Best] val_loss={val_loss:.4f} did not improve from {best_val_loss:.4f}")
+            logging.info(
+                f"[Best] val_loss={val_loss:.4f} did not improve from {best_val:.4f}"
+            )
 
-    # Final save
     save_checkpoint(
-        satt, optimizer, global_step, epoch,
-        val_loss, args.checkpoint_dir, phase=1,
+        adapter, optimizer, global_step, epoch,
+        val_loss, args.checkpoint_dir, phase=1, args=args,
     )
     logging.info("Phase 1 complete.")
 
@@ -313,20 +299,22 @@ def train_phase1(args):
 # ── Phase 2 ───────────────────────────────────────────────────────────────────
 
 def train_phase2(args):
+    from main import build_adapter
+
     logging.info("=" * 60)
-    logging.info("PHASE 2 — QLoRA Fine-Tuning")
+    logging.info(f"PHASE 2 — QLoRA Fine-Tuning "
+                 f"[{args.model_type} chunk={getattr(args,'chunk_size','N/A')}]")
     logging.info("=" * 60)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Dataset
     train_ds = MerlinCTDataset(
-        args.data_dir, args.reports_xlsx,
-        split="train", num_slices=args.num_slices,
+        args.data_dir, args.reports_xlsx, split="train",
+        num_slices=args.num_slices,
     )
     val_ds = MerlinCTDataset(
-        args.data_dir, args.reports_xlsx,
-        split="val", num_slices=args.num_slices,
+        args.data_dir, args.reports_xlsx, split="val",
+        num_slices=args.num_slices,
     )
     train_loader = DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=True,
@@ -339,45 +327,42 @@ def train_phase2(args):
         pin_memory=True,
     )
 
-    # Models
     vision_encoder = build_vision_encoder().to(device)
-    satt           = SATTAdapter().to(device)
+    adapter        = build_adapter(args).to(device)
     llm            = build_llm_phase2()
     tokenizer      = build_tokenizer()
     llm_device     = next(llm.parameters()).device
 
-    # Load Phase 1 SATT weights — prefer best over latest
-    best_path   = os.path.join(args.checkpoint_dir, "phase1_best.pt")
-    p1_pointer  = os.path.join(args.checkpoint_dir, "phase1_latest.txt")
-    if os.path.exists(best_path):
-        ckpt = torch.load(best_path, map_location="cpu")
-        satt.load_state_dict(ckpt["satt_state"])
-        logging.info(f"[Phase 2] Loaded Phase 1 BEST checkpoint (val_loss={ckpt['loss']:.4f})")
-    elif os.path.exists(p1_pointer):
-        with open(p1_pointer) as f:
-            p1_path = f.read().strip()
-        ckpt = torch.load(p1_path, map_location="cpu")
-        satt.load_state_dict(ckpt["satt_state"])
-        logging.info(f"[Phase 2] Loaded Phase 1 LATEST checkpoint from {p1_path}")
+    # Load Phase 1 best weights — try variant-specific first, then generic
+    prefix = _ckpt_prefix(args)
+    p1_best = os.path.join(args.checkpoint_dir, f"phase1_best_{prefix}.pt")
+    if not os.path.exists(p1_best):
+        p1_best = os.path.join(args.checkpoint_dir, "phase1_best.pt")
+    if os.path.exists(p1_best):
+        ckpt = torch.load(p1_best, map_location="cpu", weights_only=False)
+        adapter.load_state_dict(ckpt["satt_state"])
+        logging.info(f"[Phase 2] Loaded Phase 1 best from {p1_best} "
+                     f"(val_loss={ckpt['loss']:.4f})")
     else:
-        logging.warning("[Phase 2] No Phase 1 checkpoint found — SATT starts from random init.")
+        logging.warning("[Phase 2] No Phase 1 checkpoint found — random init.")
 
-    # Trainable: SATT + LoRA params
-    trainable = list(satt.parameters()) + [p for p in llm.parameters() if p.requires_grad]
+    trainable = list(adapter.parameters()) + \
+                [p for p in llm.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(trainable, lr=args.lr_phase2, weight_decay=0.01)
 
     start_step, start_epoch = 0, 0
     if args.resume_from == "latest":
         start_step, start_epoch = load_checkpoint(
-            args.checkpoint_dir, phase=2, satt=satt, optimizer=optimizer
+            args.checkpoint_dir, phase=2, adapter=adapter,
+            args=args, optimizer=optimizer
         )
 
-    global_step = start_step
-    accum       = args.grad_accum_steps
-    best_val_loss = float('inf')
+    global_step  = start_step
+    accum        = args.grad_accum_steps
+    best_val     = float("inf")
 
     for epoch in range(start_epoch, args.num_epochs):
-        satt.train()
+        adapter.train()
         llm.train()
         optimizer.zero_grad()
         running_loss = 0.0
@@ -385,7 +370,7 @@ def train_phase2(args):
         for step, batch in enumerate(train_loader):
             loss = forward_pass(
                 batch["slices"], batch["findings"],
-                vision_encoder, satt, llm, tokenizer, llm_device, args,
+                vision_encoder, adapter, llm, tokenizer, llm_device, args,
             )
             (loss / accum).backward()
             running_loss += loss.item()
@@ -399,49 +384,61 @@ def train_phase2(args):
                 if global_step % args.log_every == 0:
                     avg = running_loss / args.log_every
                     logging.info(
-                        f"Epoch {epoch}  step {global_step}  "
-                        f"train_loss={avg:.4f}"
+                        f"Epoch {epoch}  step {global_step}  train_loss={avg:.4f}"
                     )
                     running_loss = 0.0
 
                 if global_step % args.save_every == 0:
                     save_checkpoint(
-                        satt, optimizer, global_step, epoch,
-                        loss.item(), args.checkpoint_dir, phase=2,
+                        adapter, optimizer, global_step, epoch,
+                        loss.item(), args.checkpoint_dir, phase=2, args=args,
                     )
 
         # Validation
-        satt.eval()
+        adapter.eval()
         llm.eval()
         val_loss = 0.0
         with torch.no_grad():
-            for vbatch in val_loader:
+            for vb in val_loader:
                 vl = forward_pass(
-                    vbatch["slices"], vbatch["findings"],
-                    vision_encoder, satt, llm, tokenizer, llm_device, args,
+                    vb["slices"], vb["findings"],
+                    vision_encoder, adapter, llm, tokenizer, llm_device, args,
                 )
                 val_loss += vl.item()
         val_loss /= max(len(val_loader), 1)
         logging.info(f"Epoch {epoch} complete  val_loss={val_loss:.4f}")
 
-        # Save best model: LoRA adapter (via PEFT) + SATT weights
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            best_lora_dir = os.path.join(args.checkpoint_dir, "phase2_best_lora")
+        if val_loss < best_val:
+            best_val = val_loss
+            # Save adapter weights
+            best_satt_path = os.path.join(
+                args.checkpoint_dir, f"phase2_best_satt_{prefix}.pt"
+            )
+            torch.save({
+                "step":       global_step,
+                "epoch":      epoch,
+                "loss":       val_loss,
+                "model_type": args.model_type,
+                "chunk_size": getattr(args, "chunk_size", None),
+                "satt_state": adapter.state_dict(),
+            }, best_satt_path)
+            # Save LoRA adapter
+            best_lora_dir = os.path.join(
+                args.checkpoint_dir, f"phase2_best_lora_{prefix}"
+            )
             os.makedirs(best_lora_dir, exist_ok=True)
             llm.save_pretrained(best_lora_dir)
-            torch.save({
-                "step": global_step,
-                "epoch": epoch,
-                "loss": val_loss,
-                "satt_state": satt.state_dict(),
-            }, os.path.join(args.checkpoint_dir, "phase2_best_satt.pt"))
-            logging.info(f"[Best] New best val_loss={val_loss:.4f} saved (LoRA -> {best_lora_dir})")
+            logging.info(
+                f"[Best] New best val_loss={val_loss:.4f}  "
+                f"SATT→{best_satt_path}  LoRA→{best_lora_dir}"
+            )
         else:
-            logging.info(f"[Best] val_loss={val_loss:.4f} did not improve from {best_val_loss:.4f}")
+            logging.info(
+                f"[Best] val_loss={val_loss:.4f} did not improve from {best_val:.4f}"
+            )
 
     save_checkpoint(
-        satt, optimizer, global_step, epoch,
-        val_loss, args.checkpoint_dir, phase=2,
+        adapter, optimizer, global_step, epoch,
+        val_loss, args.checkpoint_dir, phase=2, args=args,
     )
     logging.info("Phase 2 complete.")
