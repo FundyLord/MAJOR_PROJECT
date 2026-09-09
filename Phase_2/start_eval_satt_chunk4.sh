@@ -9,7 +9,7 @@
 
 cd /home/yashjadhav23/MAJOR_PROJECT/Phase_2
 module load python/3.11.14
-source /home/yashjadhav23/merlin_env/bin/activate
+source /home/yashjadhav23/MAJOR_PROJECT/major_env/bin/activate
 
 echo "=== Eval SATT chunk=4 started at $(date) ==="
 nvidia-smi
