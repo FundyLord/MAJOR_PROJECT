@@ -94,3 +94,5 @@ outputs/
 ehthumbs.db
 
 Phase_2/checkpoints/
+
+*.pdf
