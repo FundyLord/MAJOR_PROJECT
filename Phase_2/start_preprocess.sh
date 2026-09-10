@@ -10,7 +10,7 @@
 mkdir -p logs
 
 module load python/3.11.14
-source $HOME/merlin_env/bin/activate
+source $HOME/MAJOR_PROJECT/major_env/bin/activate
 
 echo "Starting preprocessing at $(date)"
 
