@@ -1,8 +1,14 @@
 """
-train.py  —  Phase 1 and Phase 2 training loops (v2)
+train.py  —  Phase 1 and Phase 2 training loops (v4 — NaN detection added)
 
-Supports --model_type satt | baseline and --chunk_size 2|4|8
-via args passed from main.py build_adapter().
+FIX v4: If a batch produces a NaN or Inf loss (numerical overflow from an
+extreme-value sample, BF16 precision issue, etc.), that batch is now
+SKIPPED — gradients are zeroed and discarded, weights are NOT updated,
+and training continues on the next batch. Previously a single NaN batch
+would silently poison all model weights permanently, wasting the rest
+of the training run (this happened during the chunk=8 Phase 1 run,
+where training loss went from 7.24 at step 300 to nan at step 400
+and never recovered).
 """
 
 import os
@@ -118,7 +124,6 @@ def load_checkpoint(ckpt_dir, phase, adapter, args, optimizer=None):
     prefix  = _ckpt_prefix(args)
     pointer = os.path.join(ckpt_dir, f"phase{phase}_{prefix}_latest.txt")
     if not os.path.exists(pointer):
-        # Fallback: try old-style pointer (for SATT chunk=4 trained previously)
         pointer = os.path.join(ckpt_dir, f"phase{phase}_latest.txt")
     if not os.path.exists(pointer):
         logging.info("[Checkpoint] No existing checkpoint — starting from scratch.")
@@ -171,6 +176,14 @@ def forward_pass(slices, findings, vision_encoder, adapter, llm,
     return out.loss
 
 
+# ── NaN-safety helper ─────────────────────────────────────────────────────────
+
+def is_bad_loss(loss: torch.Tensor) -> bool:
+    """Returns True if loss is NaN or Inf — indicates a numerically
+    unstable batch that must be skipped rather than backpropagated."""
+    return bool(torch.isnan(loss) or torch.isinf(loss))
+
+
 # ── Phase 1 ───────────────────────────────────────────────────────────────────
 
 def train_phase1(args):
@@ -219,9 +232,10 @@ def train_phase1(args):
             args=args, optimizer=optimizer
         )
 
-    global_step  = start_step
-    accum        = args.grad_accum_steps
-    best_val     = float("inf")
+    global_step   = start_step
+    accum         = args.grad_accum_steps
+    best_val      = float("inf")
+    skipped_count = 0
 
     for epoch in range(start_epoch, args.num_epochs):
         adapter.train()
@@ -233,6 +247,17 @@ def train_phase1(args):
                 batch["slices"], batch["findings"],
                 vision_encoder, adapter, llm, tokenizer, llm_device, args,
             )
+
+            # NaN/Inf safety check — skip this batch entirely if unstable
+            if is_bad_loss(loss):
+                skipped_count += 1
+                logging.warning(
+                    f"[NaN-Guard] Skipping batch at epoch {epoch} step {step} "
+                    f"— loss was {loss.item()}. Total skipped so far: {skipped_count}"
+                )
+                optimizer.zero_grad()
+                continue
+
             (loss / accum).backward()
             running_loss += loss.item()
 
@@ -245,7 +270,8 @@ def train_phase1(args):
                 if global_step % args.log_every == 0:
                     avg = running_loss / args.log_every
                     logging.info(
-                        f"Epoch {epoch}  step {global_step}  train_loss={avg:.4f}"
+                        f"Epoch {epoch}  step {global_step}  train_loss={avg:.4f}  "
+                        f"(skipped={skipped_count})"
                     )
                     running_loss = 0.0
 
@@ -258,15 +284,27 @@ def train_phase1(args):
         # Validation
         adapter.eval()
         val_loss = 0.0
+        val_count = 0
         with torch.no_grad():
             for vb in val_loader:
                 vl = forward_pass(
                     vb["slices"], vb["findings"],
                     vision_encoder, adapter, llm, tokenizer, llm_device, args,
                 )
+                if is_bad_loss(vl):
+                    continue
                 val_loss += vl.item()
-        val_loss /= max(len(val_loader), 1)
-        logging.info(f"Epoch {epoch} complete  val_loss={val_loss:.4f}")
+                val_count += 1
+        val_loss /= max(val_count, 1)
+        logging.info(f"Epoch {epoch} complete  val_loss={val_loss:.4f}  "
+                     f"(train batches skipped this run: {skipped_count})")
+
+        if is_bad_loss(torch.tensor(val_loss)):
+            logging.error(
+                f"[NaN-Guard] Validation loss is NaN/Inf at epoch {epoch} — "
+                f"training has diverged despite batch-level skipping. "
+                f"Consider lowering --lr or inspecting the dataset for extreme values."
+            )
 
         if val_loss < best_val:
             best_val = val_loss
@@ -293,7 +331,7 @@ def train_phase1(args):
         adapter, optimizer, global_step, epoch,
         val_loss, args.checkpoint_dir, phase=1, args=args,
     )
-    logging.info("Phase 1 complete.")
+    logging.info(f"Phase 1 complete. Total batches skipped due to NaN/Inf: {skipped_count}")
 
 
 # ── Phase 2 ───────────────────────────────────────────────────────────────────
@@ -333,7 +371,6 @@ def train_phase2(args):
     tokenizer      = build_tokenizer()
     llm_device     = next(llm.parameters()).device
 
-    # Load Phase 1 best weights — try variant-specific first, then generic
     prefix = _ckpt_prefix(args)
     p1_best = os.path.join(args.checkpoint_dir, f"phase1_best_{prefix}.pt")
     if not os.path.exists(p1_best):
@@ -357,9 +394,10 @@ def train_phase2(args):
             args=args, optimizer=optimizer
         )
 
-    global_step  = start_step
-    accum        = args.grad_accum_steps
-    best_val     = float("inf")
+    global_step   = start_step
+    accum         = args.grad_accum_steps
+    best_val      = float("inf")
+    skipped_count = 0
 
     for epoch in range(start_epoch, args.num_epochs):
         adapter.train()
@@ -372,6 +410,16 @@ def train_phase2(args):
                 batch["slices"], batch["findings"],
                 vision_encoder, adapter, llm, tokenizer, llm_device, args,
             )
+
+            if is_bad_loss(loss):
+                skipped_count += 1
+                logging.warning(
+                    f"[NaN-Guard] Skipping batch at epoch {epoch} step {step} "
+                    f"— loss was {loss.item()}. Total skipped so far: {skipped_count}"
+                )
+                optimizer.zero_grad()
+                continue
+
             (loss / accum).backward()
             running_loss += loss.item()
 
@@ -384,7 +432,8 @@ def train_phase2(args):
                 if global_step % args.log_every == 0:
                     avg = running_loss / args.log_every
                     logging.info(
-                        f"Epoch {epoch}  step {global_step}  train_loss={avg:.4f}"
+                        f"Epoch {epoch}  step {global_step}  train_loss={avg:.4f}  "
+                        f"(skipped={skipped_count})"
                     )
                     running_loss = 0.0
 
@@ -398,19 +447,30 @@ def train_phase2(args):
         adapter.eval()
         llm.eval()
         val_loss = 0.0
+        val_count = 0
         with torch.no_grad():
             for vb in val_loader:
                 vl = forward_pass(
                     vb["slices"], vb["findings"],
                     vision_encoder, adapter, llm, tokenizer, llm_device, args,
                 )
+                if is_bad_loss(vl):
+                    continue
                 val_loss += vl.item()
-        val_loss /= max(len(val_loader), 1)
-        logging.info(f"Epoch {epoch} complete  val_loss={val_loss:.4f}")
+                val_count += 1
+        val_loss /= max(val_count, 1)
+        logging.info(f"Epoch {epoch} complete  val_loss={val_loss:.4f}  "
+                     f"(train batches skipped this run: {skipped_count})")
+
+        if is_bad_loss(torch.tensor(val_loss)):
+            logging.error(
+                f"[NaN-Guard] Validation loss is NaN/Inf at epoch {epoch} — "
+                f"training has diverged despite batch-level skipping. "
+                f"Consider lowering --lr_phase2 or inspecting the dataset."
+            )
 
         if val_loss < best_val:
             best_val = val_loss
-            # Save adapter weights
             best_satt_path = os.path.join(
                 args.checkpoint_dir, f"phase2_best_satt_{prefix}.pt"
             )
@@ -422,7 +482,6 @@ def train_phase2(args):
                 "chunk_size": getattr(args, "chunk_size", None),
                 "satt_state": adapter.state_dict(),
             }, best_satt_path)
-            # Save LoRA adapter
             best_lora_dir = os.path.join(
                 args.checkpoint_dir, f"phase2_best_lora_{prefix}"
             )
@@ -441,4 +500,4 @@ def train_phase2(args):
         adapter, optimizer, global_step, epoch,
         val_loss, args.checkpoint_dir, phase=2, args=args,
     )
-    logging.info("Phase 2 complete.")
+    logging.info(f"Phase 2 complete. Total batches skipped due to NaN/Inf: {skipped_count}")
