@@ -1,5 +1,5 @@
 """
-evaluate.py  —  Full evaluation suite (v2)
+evaluate.py  —  Full evaluation suite (v3 — fixed ClinicalBERT bug + incremental save)
 
 Metrics computed:
   BLEU-4         (sacrebleu)
@@ -7,12 +7,18 @@ Metrics computed:
   ROUGE-2        (rouge-score)
   ROUGE-L        (rouge-score)
   METEOR         (nltk)
-  ClinicalBERT   (bert-score with emilyalsentzer/Bio_ClinicalBERT)
+  ClinicalBERT   (bert-score with emilyalsentzer/Bio_ClinicalBERT, num_layers=12)
   RadGraph-F1    (radgraph)
 
-Supports --model_type satt | baseline and --chunk_size 2|4|8 via args.
+FIX v3: bert_score's internal model2layers dict does not include
+emilyalsentzer/Bio_ClinicalBERT, causing a KeyError crash. Bio_ClinicalBERT
+is a standard 12-layer BERT-base architecture, so num_layers=12 is now
+passed explicitly.
 
-pip install sacrebleu rouge-score bert-score nltk radgraph
+SAFETY NET v3: predictions/references are now saved incrementally to a
+raw CSV immediately after generation (before any metric computation),
+so a crash during metric computation never loses the expensive
+generation step again.
 """
 
 import os
@@ -69,6 +75,11 @@ SYSTEM_PROMPT = (
     "<|eot_id|>"
     "<|start_header_id|>assistant<|end_header_id|>\n"
 )
+
+# Bio_ClinicalBERT is a standard 12-layer BERT-base architecture.
+# bert_score's built-in model2layers dict does not include it, so we
+# must pass num_layers explicitly or it raises a KeyError.
+CLINICALBERT_NUM_LAYERS = 12
 
 
 @torch.no_grad()
@@ -128,7 +139,6 @@ def run_evaluation(args):
         adapter = SATTAdapter(chunk_size=args.chunk_size).to(device)
         satt_key = f"phase2_best_satt_chunk{args.chunk_size}.pt"
 
-    # Try specific key first, then fall back to generic
     satt_path = os.path.join(args.checkpoint_dir, satt_key)
     if not os.path.exists(satt_path):
         satt_path = os.path.join(args.checkpoint_dir, "phase2_best_satt.pt")
@@ -164,6 +174,13 @@ def run_evaluation(args):
         indices = list(range(len(test_ds)))
         logging.info(f"[Eval] Using full test set: {len(test_ds)} samples")
 
+    # ── Naming for output files ─────────────────────────────────────────────
+    variant_tag = (
+        f"{args.model_type}"
+        f"{'_chunk' + str(args.chunk_size) if args.model_type == 'satt' else ''}"
+    )
+    raw_path = os.path.join(args.checkpoint_dir, f"eval_raw_{variant_tag}.csv")
+
     predictions, references, study_ids = [], [], []
     t0 = time.time()
 
@@ -185,11 +202,22 @@ def run_evaluation(args):
                 f"{rate:.1f}s/sample  |  ETA {eta_min:.1f} min"
             )
 
-    logging.info(f"Generation complete. Computing metrics...")
+        # SAFETY NET: save raw predictions incrementally every 50 samples,
+        # so a crash during metric computation never loses generation work.
+        if (n + 1) % 50 == 0 or (n + 1) == len(indices):
+            pd.DataFrame({
+                "study_id":   study_ids,
+                "prediction": predictions,
+                "reference":  references,
+            }).to_csv(raw_path, index=False)
+
+    logging.info(f"Generation complete. Raw predictions saved → {raw_path}")
+    logging.info(f"Computing metrics...")
 
     # ── BLEU-4 ───────────────────────────────────────────────────────────────
     bleu        = BLEU(max_ngram_order=4)
     bleu_result = bleu.corpus_score(predictions, [references])
+    logging.info(f"BLEU-4 computed: {bleu_result.score:.4f}")
 
     # ── ROUGE-1, ROUGE-2, ROUGE-L ────────────────────────────────────────────
     scorer      = rs.RougeScorer(["rouge1", "rouge2", "rougeL"], use_stemmer=True)
@@ -202,6 +230,7 @@ def run_evaluation(args):
     avg_rouge1 = sum(rouge1_scores) / len(rouge1_scores)
     avg_rouge2 = sum(rouge2_scores) / len(rouge2_scores)
     avg_rougeL = sum(rougeL_scores) / len(rougeL_scores)
+    logging.info(f"ROUGE computed: R1={avg_rouge1:.4f} R2={avg_rouge2:.4f} RL={avg_rougeL:.4f}")
 
     # ── METEOR ───────────────────────────────────────────────────────────────
     meteor_scores = []
@@ -214,16 +243,25 @@ def run_evaluation(args):
             score = 0.0
         meteor_scores.append(score)
     avg_meteor = sum(meteor_scores) / len(meteor_scores)
+    logging.info(f"METEOR computed: {avg_meteor:.4f}")
 
-    # ── ClinicalBERT Score ───────────────────────────────────────────────────
+    # ── ClinicalBERT Score (FIXED: explicit num_layers) ─────────────────────
     logging.info("Computing ClinicalBERT Score...")
-    _, _, bert_f1 = bert_score(
-        predictions, references,
-        lang="en",
-        model_type="emilyalsentzer/Bio_ClinicalBERT",
-        verbose=False,
-    )
-    avg_bert = bert_f1.mean().item()
+    try:
+        _, _, bert_f1 = bert_score(
+            predictions, references,
+            lang="en",
+            model_type="emilyalsentzer/Bio_ClinicalBERT",
+            num_layers=CLINICALBERT_NUM_LAYERS,
+            verbose=False,
+        )
+        avg_bert = bert_f1.mean().item()
+        bert_f1_list = bert_f1.tolist()
+        logging.info(f"ClinicalBERT-F1 computed: {avg_bert:.4f}")
+    except Exception as e:
+        logging.error(f"[Eval] ClinicalBERT Score failed: {e}")
+        avg_bert = None
+        bert_f1_list = [None] * len(predictions)
 
     # ── RadGraph-F1 ──────────────────────────────────────────────────────────
     avg_radgraph = None
@@ -241,7 +279,7 @@ def run_evaluation(args):
                     hypothesis_annotation_lists, reference_annotation_lists
                 )
             ]
-            logging.info(f"RadGraph-F1: {avg_radgraph:.4f}")
+            logging.info(f"RadGraph-F1 computed: {avg_radgraph:.4f}")
         except Exception as e:
             logging.warning(f"[Eval] RadGraph-F1 failed: {e}")
     else:
@@ -257,17 +295,14 @@ def run_evaluation(args):
     logging.info(f"ROUGE-2    : {avg_rouge2:.4f}")
     logging.info(f"ROUGE-L    : {avg_rougeL:.4f}")
     logging.info(f"METEOR     : {avg_meteor:.4f}")
-    logging.info(f"ClinBERT-F1: {avg_bert:.4f}")
+    if avg_bert is not None:
+        logging.info(f"ClinBERT-F1: {avg_bert:.4f}")
     if avg_radgraph is not None:
         logging.info(f"RadGraph-F1: {avg_radgraph:.4f}")
     logging.info("=" * 50)
 
-    # ── Save CSV ─────────────────────────────────────────────────────────────
-    out_name = (
-        f"eval_results_{args.model_type}"
-        f"{'_chunk' + str(args.chunk_size) if args.model_type == 'satt' else ''}.csv"
-    )
-    out_path = os.path.join(args.checkpoint_dir, out_name)
+    # ── Save final CSV ───────────────────────────────────────────────────────
+    out_path = os.path.join(args.checkpoint_dir, f"eval_results_{variant_tag}.csv")
     pd.DataFrame({
         "study_id":    study_ids,
         "prediction":  predictions,
@@ -276,7 +311,7 @@ def run_evaluation(args):
         "rouge2":      rouge2_scores,
         "rougeL":      rougeL_scores,
         "meteor":      meteor_scores,
-        "bert_f1":     bert_f1.tolist(),
+        "bert_f1":     bert_f1_list,
         "radgraph_f1": radgraph_scores,
     }).to_csv(out_path, index=False)
     logging.info(f"Detailed results saved → {out_path}")
