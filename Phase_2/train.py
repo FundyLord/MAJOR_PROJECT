@@ -1,5 +1,5 @@
 """
-train.py  —  Phase 1 and Phase 2 training loops (v4 — NaN detection added)
+train.py  —  Phase 1 and Phase 2 training loops (v5 — dead-model abort guard added)
 
 FIX v4: If a batch produces a NaN or Inf loss (numerical overflow from an
 extreme-value sample, BF16 precision issue, etc.), that batch is now
@@ -9,6 +9,18 @@ would silently poison all model weights permanently, wasting the rest
 of the training run (this happened during the chunk=8 Phase 1 run,
 where training loss went from 7.24 at step 300 to nan at step 400
 and never recovered).
+
+FIX v5: The v4 skip-and-continue guard has a blind spot — if a run
+resumes from an already-corrupted checkpoint (e.g. a stale
+`phaseX_..._latest.txt` pointer left over from a previous diverged
+run), EVERY batch from step 0 onward is NaN, and the guard just
+skip-cycles forever without ever training, silently wasting GPU
+hours (this happened to chunk=8 job 1559 — it resumed from a step500
+checkpoint saved by the earlier diverged run 1553, which was already
+past its own NaN point, so it printed zero successful train_loss
+lines across ~20 hours and 20000+ skips before anyone noticed).
+Now, if every single batch since step 0 has been bad, training
+aborts immediately with a clear error instead of wasting compute.
 """
 
 import os
@@ -176,12 +188,36 @@ def forward_pass(slices, findings, vision_encoder, adapter, llm,
     return out.loss
 
 
-# ── NaN-safety helper ─────────────────────────────────────────────────────────
+# ── NaN-safety helpers ─────────────────────────────────────────────────────────
 
 def is_bad_loss(loss: torch.Tensor) -> bool:
     """Returns True if loss is NaN or Inf — indicates a numerically
     unstable batch that must be skipped rather than backpropagated."""
     return bool(torch.isnan(loss) or torch.isinf(loss))
+
+
+def check_dead_model(skipped_count: int, step: int, phase: int, args) -> None:
+    """
+    Raise if EVERY batch since step 0 has been NaN/Inf.
+
+    A handful of skipped batches mid-run is normal instability the
+    guard is designed to absorb. But if skipped_count == step + 1,
+    literally nothing has ever succeeded this run — the model is
+    dead on arrival, most commonly because it resumed from a
+    checkpoint that was already corrupted by an earlier diverged
+    run (e.g. a stale phaseX_..._latest.txt pointer). Continuing
+    would just waste GPU hours skip-cycling forever, as happened
+    with chunk=8 job 1559 (~20 hours, 20000+ skips, zero training).
+    """
+    if skipped_count > 200 and skipped_count == step + 1:
+        raise RuntimeError(
+            f"[NaN-Guard] {skipped_count} consecutive NaN batches since step 0 "
+            f"(phase {phase}, model_type={args.model_type}, "
+            f"chunk_size={getattr(args, 'chunk_size', None)}) — aborting. "
+            f"The model has never produced a finite loss this run. "
+            f"Check for a stale/corrupted resume checkpoint "
+            f"(phase{phase}_..._latest.txt) before resubmitting."
+        )
 
 
 # ── Phase 1 ───────────────────────────────────────────────────────────────────
@@ -256,6 +292,7 @@ def train_phase1(args):
                     f"— loss was {loss.item()}. Total skipped so far: {skipped_count}"
                 )
                 optimizer.zero_grad()
+                check_dead_model(skipped_count, step, phase=1, args=args)
                 continue
 
             (loss / accum).backward()
@@ -418,6 +455,7 @@ def train_phase2(args):
                     f"— loss was {loss.item()}. Total skipped so far: {skipped_count}"
                 )
                 optimizer.zero_grad()
+                check_dead_model(skipped_count, step, phase=2, args=args)
                 continue
 
             (loss / accum).backward()
