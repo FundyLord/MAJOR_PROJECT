@@ -96,3 +96,12 @@ ehthumbs.db
 Phase_2/checkpoints/
 
 *.pdf
+
+# Actual venv names used in this project (not covered by major_venv/venv/env above)
+major_env/
+radgraph_env/
+
+# Job logs and raw eval outputs
+Phase_2/logs/
+*.out
+Phase_2/eval_raw_*.csv
