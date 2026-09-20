@@ -24,8 +24,8 @@ python main.py \
   --checkpoint_dir /home/yashjadhav23/checkpoints \
   --resume_from latest \
   --num_slices 64 \
-  --batch_size 2 \
-  --grad_accum_steps 4 \
+  --batch_size 1 \
+  --grad_accum_steps 8 \
   --num_workers 16 \
   --num_epochs 3 \
   --lr 1e-4 \
