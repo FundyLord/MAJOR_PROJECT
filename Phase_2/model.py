@@ -170,6 +170,13 @@ def build_llm_phase2() -> AutoModelForCausalLM:
     """
     Phase 2 (training): Llama in 4-bit NF4 + LoRA on all 7 projection layers.
     Creates fresh random LoRA weights — use for training only.
+
+    FIX: added gradient checkpointing (+ enable_input_require_grads, +
+    use_cache=False). Needed because chunk_size=2 produces ~2x the visual
+    tokens of chunk_size=4 (T=Z/chunk_size, sequence length T*N), which was
+    enough extra attention-memory pressure to OOM at 44.5/47.4 GiB on job
+    1583 without this. Trades some extra compute (recomputing activations
+    during backward) for a large drop in peak memory.
     """
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
@@ -195,6 +202,18 @@ def build_llm_phase2() -> AutoModelForCausalLM:
     )
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
+
+    model.gradient_checkpointing_enable()
+    # Required alongside checkpointing when the base model's weights are
+    # frozen (only LoRA adapters are trainable) — otherwise the
+    # checkpointed segments have no tensor with requires_grad=True to
+    # anchor the backward recomputation to, and it silently no-ops.
+    model.enable_input_require_grads()
+    # use_cache is for autoregressive generation (KV cache), not training,
+    # and is incompatible with gradient checkpointing — leaving it on
+    # wastes memory and can trigger a warning/conflict.
+    model.config.use_cache = False
+
     return model
 
 
