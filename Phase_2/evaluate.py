@@ -38,6 +38,18 @@ isolated venv pinned to transformers==4.44.2, using the incrementally-saved
 eval_raw_<variant>.csv this script produces (see retry_radgraph.py). The
 try/except below lets this script continue past that failure gracefully.
 
+FIX v5 (Oct 2026): checkpoint loading. Earlier versions looked for the
+adapter under a name train.py never wrote ("phase2_best_satt_chunk<c>.pt"
+vs "phase2_best_satt_satt_chunk<c>.pt"), silently fell back to the original
+c=4 adapter, and always loaded LoRA weights from "phase2_best_lora". So the
+c=2 and c=8 evaluations actually ran the c=4 weights, and the Mean-Pool
+evaluation paired its adapter with the c=4 LoRA. Loading now goes through
+eval_paths.resolve_checkpoints(), which requires adapter and LoRA from the
+same training run and raises instead of falling back. Outputs go to
+--eval_out_dir and are never overwritten unless --eval_overwrite is given.
+Decoding settings and the data split are now command-line options, and
+every run writes eval_config_<variant>.json recording exactly what it used.
+
 SAFETY NET v3: predictions/references are still saved incrementally to a
 raw CSV immediately after generation (before any metric computation),
 so a crash during metric computation never loses the expensive
@@ -45,6 +57,7 @@ generation step again.
 """
 
 import os
+import json
 import time
 import random
 import logging
@@ -68,6 +81,7 @@ except ImportError:
                     "pip install radgraph to enable.")
 
 from dataset import MerlinCTDataset
+from eval_paths import resolve_checkpoints, variant_tag as _variant_tag
 from model import (
     SATTAdapter,
     MeanPoolAdapter,
@@ -158,6 +172,8 @@ def generate_report(
     tokenizer,
     slices: torch.Tensor,
     max_new_tokens: int = 600,
+    repetition_penalty: float = 1.3,
+    no_repeat_ngram_size: int = 4,
 ) -> str:
     """Generate a radiology report for one CT volume."""
     adapter.eval()
@@ -184,8 +200,8 @@ def generate_report(
         attention_mask=attn_mask,
         max_new_tokens=max_new_tokens,
         do_sample=False,
-        repetition_penalty=1.3,
-        no_repeat_ngram_size=4,
+        repetition_penalty=repetition_penalty,
+        no_repeat_ngram_size=no_repeat_ngram_size,
         pad_token_id=tokenizer.eos_token_id,
     )
     return tokenizer.decode(output_ids[0], skip_special_tokens=True)
@@ -199,29 +215,63 @@ def run_evaluation(args):
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    # ── Run settings (defaults reproduce the pre-v5 behaviour) ──────────────
+    eval_split   = getattr(args, "eval_split", "test")
+    rep_penalty  = float(getattr(args, "repetition_penalty", 1.3))
+    no_repeat_ng = int(getattr(args, "no_repeat_ngram_size", 4))
+    max_new_tok  = int(getattr(args, "max_new_tokens", 600))
+    out_dir      = getattr(args, "eval_out_dir", None) or args.checkpoint_dir
+    out_dir      = os.path.expanduser(out_dir)
+    os.makedirs(out_dir, exist_ok=True)
+
+    variant_tag = _variant_tag(args.model_type, args.chunk_size)
+    raw_path    = os.path.join(out_dir, f"eval_raw_{variant_tag}.csv")
+    out_path    = os.path.join(out_dir, f"eval_results_{variant_tag}.csv")
+    cfg_path    = os.path.join(out_dir, f"eval_config_{variant_tag}.json")
+
+    # Fail BEFORE loading any model if this run would overwrite earlier results.
+    if not getattr(args, "eval_overwrite", False):
+        for p in (raw_path, out_path):
+            if os.path.exists(p):
+                raise SystemExit(
+                    f"[Eval] {p} already exists. Choose a new --eval_out_dir, "
+                    f"or pass --eval_overwrite to replace it."
+                )
+
+    # ── Resolve checkpoints: adapter and LoRA from the SAME training run ────
+    satt_path, lora_dir, ckpt_source = resolve_checkpoints(
+        args.checkpoint_dir, args.model_type, args.chunk_size
+    )
+    logging.info(f"[Eval] Checkpoint source: {ckpt_source}")
+    logging.info(f"[Eval] split={eval_split}  repetition_penalty={rep_penalty}  "
+                 f"no_repeat_ngram_size={no_repeat_ng}  max_new_tokens={max_new_tok}")
+    logging.info(f"[Eval] Outputs -> {out_dir}")
+
     # ── Build adapter ────────────────────────────────────────────────────────
     if args.model_type == "baseline":
         adapter = MeanPoolAdapter().to(device)
-        satt_key = "phase2_best_satt_baseline.pt"
     else:
         adapter = SATTAdapter(chunk_size=args.chunk_size).to(device)
-        satt_key = f"phase2_best_satt_chunk{args.chunk_size}.pt"
-
-    satt_path = os.path.join(args.checkpoint_dir, satt_key)
-    if not os.path.exists(satt_path):
-        satt_path = os.path.join(args.checkpoint_dir, "phase2_best_satt.pt")
 
     # ── Load models ──────────────────────────────────────────────────────────
     vision_encoder = build_vision_encoder().to(device)
     vision_encoder.eval()
 
     ckpt = torch.load(satt_path, map_location="cpu", weights_only=False)
+    # The checkpoint records what it was trained as; refuse a mismatch.
+    ck_type, ck_chunk = ckpt.get("model_type"), ckpt.get("chunk_size")
+    if ck_type is not None and ck_type != args.model_type:
+        raise SystemExit(f"[Eval] {satt_path} was trained as model_type={ck_type}, "
+                         f"but this run asks for {args.model_type}.")
+    if (args.model_type == "satt" and ck_chunk is not None
+            and int(ck_chunk) != int(args.chunk_size)):
+        raise SystemExit(f"[Eval] {satt_path} was trained with chunk_size={ck_chunk}, "
+                         f"but this run asks for chunk_size={args.chunk_size}.")
     adapter.load_state_dict(ckpt["satt_state"])
     adapter.eval()
     logging.info(f"[Eval] Loaded adapter from {satt_path} "
                  f"(val_loss={ckpt['loss']:.4f}, epoch={ckpt['epoch']})")
 
-    lora_dir = os.path.join(args.checkpoint_dir, "phase2_best_lora")
     llm      = build_llm_phase2_eval(lora_dir)
     llm.eval()
     tokenizer = build_tokenizer()
@@ -230,24 +280,44 @@ def run_evaluation(args):
     # ── Dataset ──────────────────────────────────────────────────────────────
     test_ds = MerlinCTDataset(
         args.data_dir, args.reports_xlsx,
-        split="test", num_slices=args.num_slices,
+        split=eval_split, num_slices=args.num_slices,
     )
 
     if args.eval_max_samples > 0 and args.eval_max_samples < len(test_ds):
         random.seed(42)
         indices = sorted(random.sample(range(len(test_ds)), args.eval_max_samples))
         logging.info(f"[Eval] Subsampling {args.eval_max_samples} / {len(test_ds)} "
-                     f"test samples (seed=42)")
+                     f"{eval_split} samples (seed=42)")
     else:
         indices = list(range(len(test_ds)))
-        logging.info(f"[Eval] Using full test set: {len(test_ds)} samples")
+        logging.info(f"[Eval] Using full {eval_split} set: {len(test_ds)} samples")
 
-    # ── Naming for output files ─────────────────────────────────────────────
-    variant_tag = (
-        f"{args.model_type}"
-        f"{'_chunk' + str(args.chunk_size) if args.model_type == 'satt' else ''}"
-    )
-    raw_path = os.path.join(args.checkpoint_dir, f"eval_raw_{variant_tag}.csv")
+    # ── Record exactly what this run used ───────────────────────────────────
+    run_cfg = {
+        "variant": variant_tag,
+        "model_type": args.model_type,
+        "chunk_size": args.chunk_size if args.model_type == "satt" else None,
+        "adapter_path": satt_path,
+        "lora_dir": lora_dir,
+        "checkpoint_source": ckpt_source,
+        "checkpoint_val_loss": float(ckpt["loss"]),
+        "checkpoint_epoch": int(ckpt["epoch"]),
+        "checkpoint_recorded_model_type": ck_type,
+        "checkpoint_recorded_chunk_size": ck_chunk,
+        "split": eval_split,
+        "n_available": len(test_ds),
+        "n_evaluated": len(indices),
+        "subsample_seed": 42,
+        "decoding": {"do_sample": False,
+                     "repetition_penalty": rep_penalty,
+                     "no_repeat_ngram_size": no_repeat_ng,
+                     "max_new_tokens": max_new_tok},
+    }
+    with open(cfg_path, "w") as f:
+        json.dump(run_cfg, f, indent=2)
+    logging.info(f"[Eval] Run configuration saved -> {cfg_path}")
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
 
     predictions, references, study_ids = [], [], []
     t0 = time.time()
@@ -255,7 +325,10 @@ def run_evaluation(args):
     for n, i in enumerate(indices):
         sample = test_ds[i]
         pred   = generate_report(
-            vision_encoder, adapter, llm, tokenizer, sample["slices"]
+            vision_encoder, adapter, llm, tokenizer, sample["slices"],
+            max_new_tokens=max_new_tok,
+            repetition_penalty=rep_penalty,
+            no_repeat_ngram_size=no_repeat_ng,
         )
         predictions.append(pred)
         references.append(sample["findings"])
@@ -280,6 +353,18 @@ def run_evaluation(args):
             }).to_csv(raw_path, index=False)
 
     logging.info(f"Generation complete. Raw predictions saved → {raw_path}")
+
+    # ── Measured generation cost (for the computational-cost table) ─────────
+    gen_seconds = time.time() - t0
+    run_cfg["generation_seconds"] = round(gen_seconds, 1)
+    run_cfg["seconds_per_scan"] = round(gen_seconds / max(1, len(indices)), 2)
+    if torch.cuda.is_available():
+        run_cfg["peak_gpu_memory_gb"] = round(
+            torch.cuda.max_memory_allocated() / 2**30, 2)
+    with open(cfg_path, "w") as f:
+        json.dump(run_cfg, f, indent=2)
+    logging.info(f"[Eval] Generation: {run_cfg['seconds_per_scan']} s/scan, "
+                 f"peak GPU memory {run_cfg.get('peak_gpu_memory_gb', 'n/a')} GB")
     logging.info(f"Computing metrics...")
 
     # ── BLEU-4 ───────────────────────────────────────────────────────────────
@@ -384,7 +469,6 @@ def run_evaluation(args):
     logging.info("=" * 50)
 
     # ── Save final CSV ───────────────────────────────────────────────────────
-    out_path = os.path.join(args.checkpoint_dir, f"eval_results_{variant_tag}.csv")
     pd.DataFrame({
         "study_id":    study_ids,
         "prediction":  predictions,

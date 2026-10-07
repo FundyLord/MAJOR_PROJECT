@@ -90,6 +90,20 @@ def parse_args():
     # Evaluation
     p.add_argument("--eval_max_samples", type=int, default=1000,
                    help="Max test samples for evaluation. 0 = all 5123.")
+    p.add_argument("--eval_split", type=str, default="test",
+                   choices=["test", "val"],
+                   help="Which split to evaluate on. Use 'val' for tuning.")
+    p.add_argument("--eval_out_dir", type=str, default=None,
+                   help="Where eval CSVs are written (default: checkpoint_dir). "
+                        "Existing files are never overwritten without "
+                        "--eval_overwrite.")
+    p.add_argument("--eval_overwrite", action="store_true",
+                   help="Allow replacing existing eval CSVs in the output dir.")
+    p.add_argument("--repetition_penalty", type=float, default=1.3,
+                   help="Decoding repetition penalty (1.0 = off).")
+    p.add_argument("--no_repeat_ngram_size", type=int, default=4,
+                   help="Block repeated n-grams of this size (0 = off).")
+    p.add_argument("--max_new_tokens", type=int, default=600)
 
     return p.parse_args()
 
