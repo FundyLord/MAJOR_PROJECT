@@ -105,7 +105,16 @@ def _ckpt_prefix(args):
     """Generate checkpoint filename prefix based on model type."""
     if args.model_type == "baseline":
         return "baseline"
+    if args.model_type == "chunkpool":
+        return f"chunkpool_chunk{args.chunk_size}"
     return f"satt_chunk{args.chunk_size}"
+
+
+def _is_original_c4(args):
+    """The June 2026 SATT c=4 run saved un-suffixed files. Only that exact
+    configuration may fall back to them; every other variant must use its
+    own files, or start fresh."""
+    return args.model_type == "satt" and int(args.chunk_size) == 4
 
 
 def save_checkpoint(adapter, optimizer, step, epoch, loss, ckpt_dir, phase, args):
@@ -135,7 +144,7 @@ def save_checkpoint(adapter, optimizer, step, epoch, loss, ckpt_dir, phase, args
 def load_checkpoint(ckpt_dir, phase, adapter, args, optimizer=None):
     prefix  = _ckpt_prefix(args)
     pointer = os.path.join(ckpt_dir, f"phase{phase}_{prefix}_latest.txt")
-    if not os.path.exists(pointer):
+    if not os.path.exists(pointer) and _is_original_c4(args):
         pointer = os.path.join(ckpt_dir, f"phase{phase}_latest.txt")
     if not os.path.exists(pointer):
         logging.info("[Checkpoint] No existing checkpoint — starting from scratch.")
@@ -145,10 +154,18 @@ def load_checkpoint(ckpt_dir, phase, adapter, args, optimizer=None):
         ckpt_path = f.read().strip()
 
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    ck_type, ck_chunk = ckpt.get("model_type"), ckpt.get("chunk_size")
+    if ck_type is not None and ck_type != args.model_type:
+        raise SystemExit(f"[Checkpoint] {ckpt_path} is {ck_type}, not {args.model_type}.")
+    if (args.model_type != "baseline" and ck_chunk is not None
+            and int(ck_chunk) != int(args.chunk_size)):
+        raise SystemExit(f"[Checkpoint] {ckpt_path} has chunk_size={ck_chunk}, "
+                         f"not {args.chunk_size}.")
     adapter.load_state_dict(ckpt["satt_state"])
     if optimizer is not None:
         optimizer.load_state_dict(ckpt["optimizer_state"])
-    logging.info(f"[Checkpoint] Resumed step={ckpt['step']} epoch={ckpt['epoch']}")
+    logging.info(f"[Checkpoint] Resumed step={ckpt['step']} epoch={ckpt['epoch']} "
+                 f"from {ckpt_path}")
     return ckpt["step"], ckpt["epoch"]
 
 
@@ -410,15 +427,20 @@ def train_phase2(args):
 
     prefix = _ckpt_prefix(args)
     p1_best = os.path.join(args.checkpoint_dir, f"phase1_best_{prefix}.pt")
-    if not os.path.exists(p1_best):
+    if not os.path.exists(p1_best) and _is_original_c4(args):
         p1_best = os.path.join(args.checkpoint_dir, "phase1_best.pt")
-    if os.path.exists(p1_best):
-        ckpt = torch.load(p1_best, map_location="cpu", weights_only=False)
-        adapter.load_state_dict(ckpt["satt_state"])
-        logging.info(f"[Phase 2] Loaded Phase 1 best from {p1_best} "
-                     f"(val_loss={ckpt['loss']:.4f})")
-    else:
-        logging.warning("[Phase 2] No Phase 1 checkpoint found — random init.")
+    if not os.path.exists(p1_best):
+        raise SystemExit(
+            f"[Phase 2] No Phase 1 checkpoint for {prefix} "
+            f"(expected {p1_best}). Run Phase 1 for this variant first.")
+    ckpt = torch.load(p1_best, map_location="cpu", weights_only=False)
+    ck_type = ckpt.get("model_type")
+    if ck_type is not None and ck_type != args.model_type:
+        raise SystemExit(f"[Phase 2] {p1_best} was trained as {ck_type}, "
+                         f"not {args.model_type}.")
+    adapter.load_state_dict(ckpt["satt_state"])
+    logging.info(f"[Phase 2] Loaded Phase 1 best from {p1_best} "
+                 f"(val_loss={ckpt['loss']:.4f})")
 
     trainable = list(adapter.parameters()) + \
                 [p for p in llm.parameters() if p.requires_grad]

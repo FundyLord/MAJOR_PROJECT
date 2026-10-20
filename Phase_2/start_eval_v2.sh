@@ -14,7 +14,7 @@
 MODEL_TYPE="$1"
 CHUNK="$2"
 if [ -z "$MODEL_TYPE" ] || [ -z "$CHUNK" ]; then
-  echo "usage: sbatch --job-name=<name> start_eval_v2.sh <baseline|satt> <chunk_size>"
+  echo "usage: sbatch --job-name=<name> start_eval_v2.sh <baseline|satt|chunkpool> <chunk_size>"
   exit 1
 fi
 

@@ -4,6 +4,7 @@ main.py  —  Entry point for SATT Medical VLM (v2)
 Supports:
   --model_type satt      : SATT adapter with temporal chunking (default)
   --model_type baseline  : Simple mean-pool baseline for comparison
+  --model_type chunkpool : SATT chunking + pooling WITHOUT the Transformer (ablation)
   --chunk_size 2/4/8     : SATT temporal chunk size (ablation study)
 
 Usage examples
@@ -57,7 +58,7 @@ def parse_args():
 
     # Model type — controls which adapter is used
     p.add_argument("--model_type", type=str, default="satt",
-                   choices=["satt", "baseline"],
+                   choices=["satt", "baseline", "chunkpool"],
                    help="'satt' = SATT temporal adapter | 'baseline' = mean-pool")
     p.add_argument("--chunk_size", type=int, default=4,
                    choices=[2, 4, 8],
@@ -110,10 +111,14 @@ def parse_args():
 
 def build_adapter(args):
     """Build the correct adapter based on --model_type and --chunk_size."""
-    from model import SATTAdapter, MeanPoolAdapter
+    from model import SATTAdapter, MeanPoolAdapter, ChunkPoolAdapter
     if args.model_type == "baseline":
         logging.info("[Model] Using MeanPoolAdapter (baseline)")
         return MeanPoolAdapter()
+    elif args.model_type == "chunkpool":
+        logging.info(f"[Model] Using ChunkPoolAdapter (chunk_size={args.chunk_size}, "
+                     f"no Transformer)")
+        return ChunkPoolAdapter(chunk_size=args.chunk_size)
     else:
         logging.info(f"[Model] Using SATTAdapter (chunk_size={args.chunk_size})")
         return SATTAdapter(chunk_size=args.chunk_size)

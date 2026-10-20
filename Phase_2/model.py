@@ -140,6 +140,45 @@ class MeanPoolAdapter(nn.Module):
         return self.projector(pooled)
 
 
+# ── Chunk-Pool ablation (SATT without the Transformer) ───────────────────────
+
+class ChunkPoolAdapter(nn.Module):
+    """
+    SATT with the Temporal Transformer removed.
+
+    Same temporal grouping and mean pooling as SATTAdapter, same number of
+    visual tokens (T*N), same MLP projector -- but no Transformer between
+    pooling and projection. Comparing it with SATTAdapter at the same
+    chunk_size isolates the contribution of the Transformer; comparing it
+    with MeanPoolAdapter isolates the contribution of keeping T chunks
+    (more visual tokens) instead of one global average.
+
+    Input  shape : (Z, N, vision_dim)   e.g. (64, 196, 768)
+    Output shape : (1, T*N, llm_dim)    e.g. (1, 3136, 3072) for chunk_size=4
+    """
+
+    def __init__(
+        self,
+        vision_dim: int = VISION_DIM,
+        llm_dim:    int = LLM_DIM,
+        chunk_size: int = 4,
+    ):
+        super().__init__()
+        self.chunk_size = chunk_size
+        self.projector = nn.Sequential(
+            nn.Linear(vision_dim, 2048),
+            nn.GELU(),
+            nn.Linear(2048, llm_dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        Z, N, D = x.shape
+        T = Z // self.chunk_size
+        compressed = x.view(T, self.chunk_size, N, D).mean(dim=1)   # (T, N, D)
+        sequence = compressed.view(1, T * N, D)                     # (1, T*N, D)
+        return self.projector(sequence)
+
+
 # ── Builder helpers ──────────────────────────────────────────────────────────
 
 def build_vision_encoder() -> SiglipVisionModel:

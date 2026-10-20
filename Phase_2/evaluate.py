@@ -85,6 +85,7 @@ from eval_paths import resolve_checkpoints, variant_tag as _variant_tag
 from model import (
     SATTAdapter,
     MeanPoolAdapter,
+    ChunkPoolAdapter,
     build_vision_encoder,
     build_llm_phase2_eval,
     build_tokenizer,
@@ -210,7 +211,7 @@ def generate_report(
 def run_evaluation(args):
     logging.info("=" * 60)
     logging.info(f"EVALUATION — {args.model_type.upper()} "
-                 f"(chunk={args.chunk_size if args.model_type=='satt' else 'N/A'})")
+                 f"(chunk={args.chunk_size if args.model_type!='baseline' else 'N/A'})")
     logging.info("=" * 60)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -250,6 +251,8 @@ def run_evaluation(args):
     # ── Build adapter ────────────────────────────────────────────────────────
     if args.model_type == "baseline":
         adapter = MeanPoolAdapter().to(device)
+    elif args.model_type == "chunkpool":
+        adapter = ChunkPoolAdapter(chunk_size=args.chunk_size).to(device)
     else:
         adapter = SATTAdapter(chunk_size=args.chunk_size).to(device)
 
@@ -263,7 +266,7 @@ def run_evaluation(args):
     if ck_type is not None and ck_type != args.model_type:
         raise SystemExit(f"[Eval] {satt_path} was trained as model_type={ck_type}, "
                          f"but this run asks for {args.model_type}.")
-    if (args.model_type == "satt" and ck_chunk is not None
+    if (args.model_type in ("satt", "chunkpool") and ck_chunk is not None
             and int(ck_chunk) != int(args.chunk_size)):
         raise SystemExit(f"[Eval] {satt_path} was trained with chunk_size={ck_chunk}, "
                          f"but this run asks for chunk_size={args.chunk_size}.")
@@ -296,7 +299,7 @@ def run_evaluation(args):
     run_cfg = {
         "variant": variant_tag,
         "model_type": args.model_type,
-        "chunk_size": args.chunk_size if args.model_type == "satt" else None,
+        "chunk_size": args.chunk_size if args.model_type != "baseline" else None,
         "adapter_path": satt_path,
         "lora_dir": lora_dir,
         "checkpoint_source": ckpt_source,
@@ -455,7 +458,7 @@ def run_evaluation(args):
     # ── Print results ─────────────────────────────────────────────────────────
     logging.info("=" * 50)
     logging.info(f"Model      : {args.model_type} "
-                 f"(chunk={args.chunk_size if args.model_type=='satt' else 'N/A'})")
+                 f"(chunk={args.chunk_size if args.model_type!='baseline' else 'N/A'})")
     logging.info(f"Samples    : {len(predictions)}")
     logging.info(f"BLEU-4     : {bleu_result.score:.4f}")
     logging.info(f"ROUGE-1    : {avg_rouge1:.4f}")

@@ -24,7 +24,11 @@ import os
 
 def variant_tag(model_type: str, chunk_size: int) -> str:
     """Same naming as train._ckpt_prefix."""
-    return "baseline" if model_type == "baseline" else f"satt_chunk{chunk_size}"
+    if model_type == "baseline":
+        return "baseline"
+    if model_type == "chunkpool":
+        return f"chunkpool_chunk{chunk_size}"
+    return f"satt_chunk{chunk_size}"
 
 
 def resolve_checkpoints(checkpoint_dir: str, model_type: str, chunk_size: int):
