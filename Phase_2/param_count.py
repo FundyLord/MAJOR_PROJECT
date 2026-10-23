@@ -31,8 +31,10 @@ def m(x):
 with init_empty_weights():
     vision = SiglipVisionModel(SiglipVisionConfig.from_pretrained(SIGLIP_ID))
 vision_total = n(vision)
-head = getattr(vision.vision_model, "head", None)
-vision_head = n(head) if head is not None else 0
+# The pooling head's location differs between transformers versions
+# (vision.vision_model.head in some, vision.head in others), so find it by name.
+heads = [mod for name, mod in vision.named_modules() if name.split(".")[-1] == "head"]
+vision_head = n(heads[0]) if heads else 0
 
 # ---- language model (frozen base) + LoRA (trainable) ---------------------------
 with init_empty_weights():
