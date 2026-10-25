@@ -37,13 +37,18 @@ import sys
 import numpy as np
 import pandas as pd
 
-VARIANTS = [                      # (file tag, display name), worst -> best
+VARIANTS = [                      # (file tag, display name)
     ("baseline", "Mean-Pool"),
+    ("chunkpool_chunk4", "ChunkPool c=4"),   # c=4 chunking without the Transformer
     ("satt_chunk8", "c=8"),
     ("satt_chunk4", "c=4"),
     ("satt_chunk2", "c=2"),
 ]
-PAIRS = [                         # (better, worse) by the paper's ordering
+# The full-ordering check (part 3) uses only the original four variants.
+ORDER_TAGS = ["baseline", "satt_chunk8", "satt_chunk4", "satt_chunk2"]
+PAIRS = [                         # (A, B): difference A - B
+    ("satt_chunk4", "chunkpool_chunk4"),   # effect of the Transformer (same tokens)
+    ("chunkpool_chunk4", "baseline"),      # effect of chunking / 16x more tokens
     ("satt_chunk2", "satt_chunk4"),
     ("satt_chunk4", "satt_chunk8"),
     ("satt_chunk8", "baseline"),
@@ -233,7 +238,7 @@ def main():
     print("=" * 78)
     rows = []
     for col, mname in metrics:
-        tags = [t for t, _ in VARIANTS]
+        tags = ORDER_TAGS
         if not all((col, t) in dist for t in tags):
             continue
         m = np.stack([dist[(col, t)] for t in tags], axis=1)

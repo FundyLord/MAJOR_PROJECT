@@ -34,7 +34,8 @@ import re
 import numpy as np
 import pandas as pd
 
-VARIANTS = [("baseline", "Mean-Pool"), ("satt_chunk8", "c=8"),
+VARIANTS = [("baseline", "Mean-Pool"), ("chunkpool_chunk4", "ChunkPool c=4"),
+            ("satt_chunk8", "c=8"),
             ("satt_chunk4", "c=4"), ("satt_chunk2", "c=2")]
 
 SECTIONS = ["Lower thorax", "Liver and biliary tree", "Gallbladder", "Spleen",

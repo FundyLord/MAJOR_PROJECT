@@ -38,8 +38,17 @@ vision_head = n(heads[0]) if heads else 0
 
 # ---- language model (frozen base) + LoRA (trainable) ---------------------------
 with init_empty_weights():
-    llm = AutoModelForCausalLM.from_config(AutoConfig.from_pretrained(LLAMA_ID))
+    llm_cfg = AutoConfig.from_pretrained(LLAMA_ID)
+    llm = AutoModelForCausalLM.from_config(llm_cfg)
+    # Llama 3.2-3B ties the output layer to the input embedding (one shared
+    # 128,256 x 3,072 matrix). On the meta device the tie is not always applied,
+    # which would count that matrix twice (+394M), so tie and check explicitly.
+    llm.tie_weights()
     llm_base = n(llm)
+    if (getattr(llm_cfg, "tie_word_embeddings", False)
+            and llm.lm_head.weight is not llm.get_input_embeddings().weight):
+        llm_base -= llm.lm_head.weight.numel()
+    print(f"[check] tie_word_embeddings = {getattr(llm_cfg, 'tie_word_embeddings', None)}")
     lora_cfg = LoraConfig(
         r=16, lora_alpha=32, lora_dropout=0.05, bias="none", task_type="CAUSAL_LM",
         target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
