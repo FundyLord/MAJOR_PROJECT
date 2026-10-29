@@ -106,3 +106,4 @@ Phase_2/logs/
 *.out
 Phase_2/eval_raw_*.csv
 Phase_2/demo_scans/
+Phase_2/demo_out/
